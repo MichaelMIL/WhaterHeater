@@ -12,7 +12,7 @@
 #include "tz_lookup.h"
 
 // ---------- Configuration ----------
-static const char *FW_VERSION = "v1.4 built " __DATE__ " " __TIME__;
+static const char *FW_VERSION = "v1.5 built " __DATE__ " " __TIME__;
 static const char *AP_SSID = "WaterHeater";
 static const char *AP_PASSWORD = "12345678"; // min 8 chars, or "" for an open network
 static const char *DEFAULT_HOSTNAME = "waterheater"; // http://<hostname>.local, settable in settings
@@ -310,6 +310,101 @@ static void saveSchedConfig() {
   prefs.end();
 }
 
+// ---------- One-time schedule (fires once at an absolute time, then clears) ----------
+// Set from the web page, the bots or the PC bot: "heat at 17:30 for 45 min".
+// Stored in NVS so it survives a reboot. If the device comes back more than
+// ONCE_LATE_SECS after the time has passed, the run is skipped rather than
+// started late at a surprising moment.
+uint32_t onceAt = 0;   // epoch seconds, 0 = nothing pending
+uint16_t onceDur = 30; // minutes
+static const uint32_t ONCE_LATE_SECS = 15 * 60;
+
+static void loadOnceConfig() {
+  prefs.begin("once", false);
+  onceAt = prefs.getUInt("at", 0);
+  onceDur = prefs.getUShort("dur", 30);
+  prefs.end();
+}
+
+static void saveOnceConfig() {
+  prefs.begin("once", false);
+  prefs.putUInt("at", onceAt);
+  prefs.putUShort("dur", onceDur);
+  prefs.end();
+}
+
+static bool clockSynced() { return time(nullptr) > 1600000000; }
+
+// Local "YYYY-MM-DD HH:MM" for an epoch time (device timezone).
+static String localStamp(time_t t) {
+  struct tm lt;
+  localtime_r(&t, &lt);
+  char buf[20];
+  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &lt);
+  return String(buf);
+}
+
+static String onceJson() {
+  String json = "{\"at\":" + String(onceAt);
+  json += ",\"dur\":" + String(onceDur);
+  if (onceAt) {
+    time_t nowT = time(nullptr);
+    json += ",\"local\":\"" + localStamp((time_t)onceAt) + "\"";
+    json += ",\"in\":" + String((long)onceAt > (long)nowT ? (long)(onceAt - nowT) : 0L);
+  }
+  json += "}";
+  return json;
+}
+
+// day: 0 = today, 1 = tomorrow, -1 = next occurrence of hh:mm.
+static bool onceSetLocal(int hh, int mm, int dur, int day) {
+  if (!clockSynced()) return false;
+  time_t nowT = time(nullptr);
+  struct tm lt;
+  localtime_r(&nowT, &lt);
+  lt.tm_hour = hh;
+  lt.tm_min = mm;
+  lt.tm_sec = 0;
+  lt.tm_isdst = -1;
+  if (day > 0) lt.tm_mday += day;
+  time_t t = mktime(&lt);
+  if (day < 0 && t <= nowT) { // already passed today -> tomorrow
+    lt.tm_mday += 1;
+    lt.tm_isdst = -1;
+    t = mktime(&lt);
+  }
+  if (t <= nowT) return false;
+  onceAt = (uint32_t)t;
+  onceDur = (uint16_t)dur;
+  saveOnceConfig();
+  Serial.printf("One-time schedule set: %s for %d min\n", localStamp(t).c_str(), dur);
+  return true;
+}
+
+static void onceCancel() {
+  if (!onceAt) return;
+  onceAt = 0;
+  saveOnceConfig();
+  Serial.println("One-time schedule cancelled");
+}
+
+// Called once a second from loop(). Fires (and clears) the pending run.
+static void onceTick() {
+  if (!onceAt || !clockSynced()) return;
+  time_t nowT = time(nullptr);
+  if ((long)nowT < (long)onceAt) return;
+  uint32_t late = (uint32_t)nowT - onceAt;
+  uint16_t dur = onceDur;
+  onceAt = 0;
+  saveOnceConfig();
+  if (late <= ONCE_LATE_SECS) {
+    startTimer(dur);
+    Serial.printf("One-time schedule fired: ON for %u min\n", dur);
+  } else {
+    Serial.printf("One-time schedule skipped (%u s late)\n", late);
+  }
+}
+
 // ---------- Rate limiting (user-initiated state changes) ----------
 // At most 10 changes per 5 minutes across web / Telegram / button. Actions
 // that turn things OFF are always allowed (never lock yourself out of
@@ -541,6 +636,7 @@ static String tgStatusText() {
   } else {
     t += "\nTimer: off";
   }
+  if (onceAt) t += "\nOnce: " + localStamp((time_t)onceAt) + " for " + String(onceDur) + " min";
   if (WiFi.status() == WL_CONNECTED) {
     t += "\nWiFi: " + WiFi.SSID() + " (" + WiFi.localIP().toString() + ")";
   }
@@ -573,6 +669,8 @@ static const char TG_HELP[] =
     "/allon /alloff - both relays\n"
     "/timer N - both relays ON for N minutes (1-720)\n"
     "/cancel - cancel timer (relays off)\n"
+    "/once HH:MM N - heat once at HH:MM for N min\n"
+    "/once off - cancel the one-time schedule\n"
     "/polarity R high|low - what ON drives on pin (R = 1 or 2)\n"
     "/chatid - show this chat's ID";
 
@@ -673,6 +771,29 @@ static void tgHandleMessages(UniversalTelegramBot *b, int count, const String &a
         }
       } else {
         b->sendMessage(chat, "Usage: /timer N  (minutes, 1-720)", "");
+      }
+    } else if (cmd.startsWith("/once")) {
+      String args = cmd.substring(5);
+      args.trim();
+      int colon = args.indexOf(':'), space = args.indexOf(' ');
+      if (args == "off" || args == "cancel") {
+        onceCancel();
+        b->sendMessage(chat, "One-time schedule cancelled", "");
+      } else if (args.length() == 0) {
+        b->sendMessage(chat, onceAt ? "Once: " + localStamp((time_t)onceAt) + " for " + String(onceDur) + " min"
+                                    : "No one-time schedule. Usage: /once HH:MM MINUTES", "");
+      } else if (colon > 0 && space > colon) {
+        long hh = args.substring(0, colon).toInt(), mm = args.substring(colon + 1, space).toInt();
+        long dur = args.substring(space + 1).toInt();
+        if (hh < 0 || hh > 23 || mm < 0 || mm > 59 || dur < 1 || dur > 720) {
+          b->sendMessage(chat, "Usage: /once HH:MM MINUTES  (1-720)", "");
+        } else if (!onceSetLocal((int)hh, (int)mm, (int)dur, -1)) {
+          b->sendMessage(chat, "Clock not synced yet, try again in a minute", "");
+        } else {
+          b->sendMessage(chat, "Will heat once at " + localStamp((time_t)onceAt) + " for " + String(dur) + " min", "");
+        }
+      } else {
+        b->sendMessage(chat, "Usage: /once HH:MM MINUTES  or  /once off", "");
       }
     } else if (cmd.startsWith("/polarity")) {
       String args = cmd.substring(9);
@@ -889,6 +1010,25 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
   <button id="tcancel" class="cancel hidden" onclick="cancelTimer()">Cancel timer</button>
 </div>
 
+<div class="card block">
+  <div class="theader">
+    <h2>Heat once</h2>
+    <span id="ostate"></span>
+  </div>
+  <div id="opending" class="hidden">
+    <div class="state" id="otext" style="font-size:1rem;color:#f9fafb;margin-bottom:10px"></div>
+    <button class="cancel" onclick="onceCancel()">Cancel</button>
+  </div>
+  <div id="oform">
+    <div class="sliderrow" style="gap:10px">
+      <input type="time" id="otime" value="18:00" style="font-size:1rem;padding:8px;border-radius:8px;border:0">
+      <input type="number" id="odur" min="1" max="720" value="45" style="width:70px;font-size:1rem;padding:8px;border-radius:8px;border:0"> <span>min</span>
+      <button class="start" onclick="onceSet()">Set</button>
+    </div>
+    <div class="state" style="margin-top:8px">Runs once at the next occurrence of that time (device local time).</div>
+  </div>
+</div>
+
 <div id="conn"></div>
 
 <script>
@@ -901,6 +1041,33 @@ function render(s) {
   document.getElementById('state2').textContent = s.relay2 ? 'ON' : 'off';
   timerEnd = s.timer > 0 ? Date.now() + s.timer * 1000 : 0;
   renderTimer();
+  renderOnce(s.once);
+}
+
+function renderOnce(o) {
+  const pending = !!(o && o.at);
+  document.getElementById('opending').classList.toggle('hidden', !pending);
+  document.getElementById('oform').classList.toggle('hidden', pending);
+  document.getElementById('ostate').textContent = pending ? 'pending' : '';
+  if (pending) {
+    const h = Math.floor(o.in / 3600), m = Math.floor((o.in % 3600) / 60);
+    document.getElementById('otext').textContent =
+      `${o.local.slice(11)} on ${o.local.slice(8, 10)}/${o.local.slice(5, 7)} for ${o.dur} min (in ${h ? h + 'h ' : ''}${m}m)`;
+  }
+}
+async function onceSet() {
+  const [hh, mm] = document.getElementById('otime').value.split(':');
+  const dur = document.getElementById('odur').value;
+  try {
+    const r = await fetch(`/once/set?hh=${hh}&mm=${mm}&dur=${dur}`);
+    const j = await r.json();
+    if (j.error) { document.getElementById('conn').textContent = j.error; return; }
+    document.getElementById('conn').textContent = '';
+    refresh();
+  } catch (e) {}
+}
+async function onceCancel() {
+  try { await fetch('/once/cancel'); refresh(); } catch (e) {}
 }
 
 function renderTimer() {
@@ -1554,6 +1721,7 @@ static String stateJson() {
   json += relay2On ? "true" : "false";
   json += ",\"timer\":" + String(timerRemainingSecs());
   json += ",\"today\":" + String(usageTodaySecs());
+  json += ",\"once\":" + onceJson();
   json += "}";
   return json;
 }
@@ -1750,6 +1918,35 @@ static void handleSchedSet() {
   handleSchedGet();
 }
 
+static void handleOnceGet() {
+  server.send(200, "application/json", onceJson());
+}
+
+// /once/set?hh=17&mm=30&dur=45[&day=0|1]   (day omitted = next occurrence)
+static void handleOnceSet() {
+  long hh = server.arg("hh").toInt(), mm = server.arg("mm").toInt();
+  long dur = server.arg("dur").toInt();
+  long day = server.hasArg("day") ? server.arg("day").toInt() : -1;
+  if (hh < 0 || hh > 23 || mm < 0 || mm > 59 || dur < 1 || dur > 720 || day > 1) {
+    server.send(400, "application/json", "{\"error\":\"hh 0-23, mm 0-59, dur 1-720, day 0|1\"}");
+    return;
+  }
+  if (!clockSynced()) {
+    server.send(503, "application/json", "{\"error\":\"clock not synced yet\"}");
+    return;
+  }
+  if (!onceSetLocal((int)hh, (int)mm, (int)dur, (int)day)) {
+    server.send(400, "application/json", "{\"error\":\"that time has already passed\"}");
+    return;
+  }
+  server.send(200, "application/json", onceJson());
+}
+
+static void handleOnceCancel() {
+  onceCancel();
+  server.send(200, "application/json", onceJson());
+}
+
 static void handleReboot() {
   server.send(200, "application/json", "{\"ok\":true}");
   rebootAtMs = millis() + 600; // let the response reach the browser first
@@ -1933,6 +2130,7 @@ void setup() {
   loadRelayConfig(); // polarity must be known before driving the pins
   loadButtonConfig();
   loadSchedConfig();
+  loadOnceConfig();
   loadLedConfig();
   pinMode(RELAY1_PIN, OUTPUT);
   pinMode(RELAY2_PIN, OUTPUT);
@@ -2001,6 +2199,9 @@ void setup() {
   server.on("/sys/set", handleSysSet);
   server.on("/sched/get", handleSchedGet);
   server.on("/sched/set", handleSchedSet);
+  server.on("/once/get", handleOnceGet);
+  server.on("/once/set", handleOnceSet);
+  server.on("/once/cancel", handleOnceCancel);
   server.on("/reboot", HTTP_POST, handleReboot);
   server.onNotFound(handleNotFound);
   server.begin();
@@ -2061,6 +2262,8 @@ void loop() {
         }
       }
     }
+
+    onceTick(); // one-time schedule
 
     // Safety cap: no relay stays on longer than maxOnMinutes.
     if (maxOnMinutes > 0) {

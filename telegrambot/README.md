@@ -79,6 +79,8 @@ logging gap is never mistaken for an idle heater.
 | `/on` | Heat for 30 minutes |
 | `/off` | Heater off (cancels a running timer) |
 | `/timer N` | Heat for N minutes (1–720) |
+| `/once` | One-time run wizard: hour → minutes → duration (or direct: `/once HH:MM MIN`) |
+| `/once off` | Cancel the pending one-time run |
 | `/settings` | Schedule wizard: tap a slot → hour → minutes → duration |
 | `/setsched` | Same wizard (or direct: `/setsched N HH:MM MIN`) |
 | `/delsched N` | Disable schedule slot N |
@@ -103,7 +105,9 @@ pages. Open <http://localhost:4245/> on the bot PC, or
 
 - **Control** (`/`): live status (heating / timer left / heated today) and
   the panel buttons — Heater ON (30m), Heater OFF, Heat 15 min, Heat 60
-  min, custom minutes (like `/timer N`).
+  min, custom minutes (like `/timer N`) — plus a **Heat once** card: pick a
+  time and duration and the heater runs one time at the next occurrence of
+  that time, then the entry clears.
 - **History** (`/history`): today's total and cycle count, the last 10
   cycles (the running one is marked live), and the 14-day usage graph.
 - **Settings** (`/settings`): device info (timezone, device time, max
@@ -134,7 +138,20 @@ GET  /api/history                                today's total + last 10 cycles
 GET  /graph.png                                  the /graph image
 GET  /api/settings                               device info + schedule slots
 POST /api/schedule {"slot":0-4,"en":true,"hh":6,"mm":30,"dur":45}
+GET  /api/once                                   pending one-time run
+POST /api/once     {"hh":17,"mm":30,"dur":45}  or  {"cancel":true}
 ```
+
+## One-time scheduled run
+
+Available everywhere: the `/once` command and the ⏰ **Heat once** menu
+button in Telegram, the **Heat once** card on the web panel, the same card on
+the device's own page, and `/once HH:MM N` in the device's built-in bot.
+The run is stored **on the device** (`/once/set`, `/once/get`,
+`/once/cancel`), so it fires even if the bot PC is off. "Next occurrence"
+semantics: if the time has already passed today it is set for tomorrow. If
+the device was powered off and comes back more than 15 minutes late, the
+run is skipped instead of starting unexpectedly.
 
 ## Alerts & daily summary
 
@@ -157,6 +174,7 @@ that turn the heater OFF are never blocked. Event logs rotate monthly
 - `GET /state` → `{"relay1":bool,"relay2":bool,"timer":seconds}`
 - `GET /set?relay=all&state=on|off`
 - `GET /timer/set?mins=N` / `GET /timer/cancel`
+- `GET /once/get`, `GET /once/set?hh=H&mm=M&dur=MIN[&day=0|1]`, `GET /once/cancel`
 
 ## Run at boot (optional)
 

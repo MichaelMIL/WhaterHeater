@@ -94,6 +94,8 @@ HELP_TEXT = (
     "/on - heat for 30 min\n"
     "/off - heater off\n"
     "/timer N - heat for N minutes (1-720)\n"
+    "/once HH:MM N - heat once at HH:MM for N min (wizard: /once)\n"
+    "/once off - cancel the one-time schedule\n"
     "/settings - daily schedules & device info\n"
     "/setsched - schedule wizard (or: /setsched N HH:MM MINUTES)\n"
     "/delsched N - disable schedule slot N\n"
@@ -280,6 +282,30 @@ def backfill_from_device() -> int:
         print(f"backfilled {len(added)} cycle(s) from the device")
     return len(added)
 
+def get_once() -> dict:
+    return device_get("/once/get")
+
+def set_once(hh: int, mm: int, dur: int, day: int = None) -> dict:
+    params = {"hh": hh, "mm": mm, "dur": dur}
+    if day is not None:
+        params["day"] = day
+    return device_get("/once/set", **params)
+
+def cancel_once() -> dict:
+    return device_get("/once/cancel")
+
+def once_text(once: dict) -> str:
+    """'17:30 today for 45 min (in 2h 10m)' or '' when nothing is pending."""
+    if not once or not once.get("at"):
+        return ""
+    local = once.get("local", "")
+    when = local[11:]
+    if local[:10] == now().strftime("%Y-%m-%d"):
+        when += " today"
+    else:
+        when += f" on {local[8:10]}/{local[5:7]}"
+    return f"{when} for {once.get('dur')} min (in {fmt_duration(int(once.get('in', 0)))})"
+
 def get_schedules() -> list:
     return device_get("/sched/get")["slots"]
 
@@ -446,6 +472,9 @@ def status_text(state: dict) -> str:
     else:
         lines.append("Timer: off")
     lines.append(f"Heated today: {fmt_duration(daily_totals(1)[now().date()])}")
+    pending = once_text(state.get("once"))
+    if pending:
+        lines.append(f"⏰ Once: {pending}")
     return "\n".join(lines)
 
 def menu_keyboard(state: dict) -> dict:
@@ -458,7 +487,8 @@ def menu_keyboard(state: dict) -> dict:
             [{"text": "\U0001F4CA History", "callback_data": "history"},
              {"text": "\U0001F4C8 Graph", "callback_data": "graph"},
              {"text": "\U0001F504", "callback_data": "menu"}],
-            [{"text": "⚙️ Schedules", "callback_data": "w"}],
+            [{"text": "⏰ Heat once", "callback_data": "o"},
+             {"text": "⚙️ Schedules", "callback_data": "w"}],
         ]
     }
 
@@ -758,6 +788,52 @@ def wizard_render(data: str) -> tuple:
     set_schedule(slot, True, hh, mm, dur)
     return wizard_home(f"✅ Schedule {slot + 1}: every day at {hh:02d}:{mm:02d} for {dur} min")
 
+# ---------- one-time schedule wizard (stateless, like the daily one) ----------
+# "o"          -> overview (pending run or hour picker)   "o:17"      -> minutes
+# "o:17:30"    -> duration                                 "o:17:30:45" -> apply
+# "oc"         -> cancel pending run                       "on"        -> new (hour picker)
+
+def once_home(note: str = "") -> tuple:
+    pending = once_text(get_once())
+    lines = ["⏰ Heat once"]
+    if note:
+        lines.insert(0, note + "\n")
+    if pending:
+        lines.append(f"Pending: {pending}")
+        kb = [[{"text": "🗑 Cancel it", "callback_data": "oc"},
+               {"text": "✏️ Change", "callback_data": "on"}],
+              [{"text": "◀ Menu", "callback_data": "menu"}]]
+        return "\n".join(lines), {"inline_keyboard": kb}
+    lines.append("Nothing pending — pick the start hour:")
+    rows = _grid(range(24), lambda h: f"{h:02d}", lambda h: f"o:{h}", 6)
+    rows.append([{"text": "◀ Menu", "callback_data": "menu"}])
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+def once_render(data: str) -> tuple:
+    if data == "o":
+        return once_home()
+    if data == "oc":
+        cancel_once()
+        return once_home("One-time schedule cancelled")
+    if data == "on":
+        rows = _grid(range(24), lambda h: f"{h:02d}", lambda h: f"o:{h}", 6)
+        rows.append([{"text": "◀ Back", "callback_data": "o"}])
+        return "⏰ Heat once — pick the start hour:", {"inline_keyboard": rows}
+    parts = data.split(":")
+    hh = int(parts[1])
+    if len(parts) == 2:
+        rows = _grid([0, 15, 30, 45], lambda m: f"{hh:02d}:{m:02d}", lambda m: f"o:{hh}:{m}", 4)
+        rows.append([{"text": "◀ Back", "callback_data": "on"}])
+        return "⏰ Heat once — pick the start time:", {"inline_keyboard": rows}
+    mm = int(parts[2])
+    if len(parts) == 3:
+        rows = _grid([15, 30, 45, 60, 90, 120], lambda d: f"{d} min", lambda d: f"o:{hh}:{mm}:{d}", 3)
+        rows.append([{"text": "◀ Back", "callback_data": f"o:{hh}"}])
+        return f"⏰ Heat once at {hh:02d}:{mm:02d} — pick the duration:", {"inline_keyboard": rows}
+    dur = int(parts[3])
+    once = set_once(hh, mm, dur)
+    return once_home(f"✅ Will heat once at {once_text(once)}")
+
 # ---------- command handling ----------
 
 def apply_action(data: str) -> str:
@@ -815,6 +891,26 @@ def handle_command(chat_id, text: str):
         if not ok:
             tg("sendMessage", chat_id=chat_id,
                text="Just send /setsched for the wizard, or: /setsched N HH:MM MINUTES")
+    elif cmd == "/once":
+        if not arg:
+            text, kb = once_home()
+            tg("sendMessage", chat_id=chat_id, text=text, reply_markup=kb)
+        elif arg.lower() in ("off", "cancel"):
+            cancel_once()
+            tg("sendMessage", chat_id=chat_id, text="One-time schedule cancelled")
+        else:
+            parts = arg.split()
+            ok = False
+            if len(parts) == 2 and ":" in parts[0] and parts[1].isdigit():
+                hh, _, mm = parts[0].partition(":")
+                dur = int(parts[1])
+                if hh.isdigit() and mm.isdigit() and 0 <= int(hh) <= 23 and 0 <= int(mm) <= 59 and 1 <= dur <= 720:
+                    once = set_once(int(hh), int(mm), dur)
+                    tg("sendMessage", chat_id=chat_id, text=f"⏰ Will heat once at {once_text(once)}")
+                    ok = True
+            if not ok:
+                tg("sendMessage", chat_id=chat_id,
+                   text="Usage: /once HH:MM MINUTES  (or just /once for the wizard, /once off to cancel)")
     elif cmd == "/delsched":
         if arg.isdigit() and 1 <= int(arg) <= 5:
             set_schedule(int(arg) - 1, False)
@@ -870,6 +966,11 @@ def handle_update(update: dict):
         try:
             if data == "w" or data.startswith("w:") or data.startswith("wd:"):
                 text, kb = wizard_render(data)
+                tg("editMessageText", chat_id=chat_id,
+                   message_id=q["message"]["message_id"], text=text, reply_markup=kb)
+                return
+            if data in ("o", "oc", "on") or data.startswith("o:"):
+                text, kb = once_render(data)
                 tg("editMessageText", chat_id=chat_id,
                    message_id=q["message"]["message_id"], text=text, reply_markup=kb)
                 return

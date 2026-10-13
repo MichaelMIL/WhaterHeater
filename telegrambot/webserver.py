@@ -19,6 +19,8 @@ JSON API (used by the page, usable from scripts too):
   GET  /api/usage?days=N -> per-day + per-hour totals for the charts (1-90)
   GET  /graph.png      -> the same PNG /graph sends in Telegram
   GET  /api/settings   -> device info (tz, time, max on) + schedule slots
+  GET  /api/once       -> pending one-time run (at, dur, local, in, text)
+  POST /api/once       {"hh": H, "mm": M, "dur": MIN}  or  {"cancel": true}
   POST /api/schedule   {"slot": 0-4, "en": bool, "hh": H, "mm": M, "dur": MIN}
 """
 
@@ -55,6 +57,7 @@ STYLE = r"""
     --nav:#0f172a; --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.35);
   }
   * { box-sizing:border-box; }
+  [hidden] { display:none !important; }
   html { color-scheme: light dark; }
   body { margin:0; background:var(--bg); color:var(--ink); -webkit-font-smoothing:antialiased;
          font:15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif; }
@@ -99,6 +102,13 @@ STYLE = r"""
   .custom { display:flex; gap:10px; margin-top:10px; }
   .custom input { flex:1; min-width:0; font-size:15px; padding:12px 14px; border:1px solid var(--line); border-radius:12px; background:var(--bg); color:var(--ink); }
   .custom input:focus, select:focus { outline:2px solid var(--accent); outline-offset:1px; }
+  .once { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .once input[type=time] { font-size:15px; padding:11px 12px; border:1px solid var(--line); border-radius:12px; background:var(--bg); color:var(--ink); }
+  .once select { font-size:15px; padding:11px 12px; border:1px solid var(--line); border-radius:12px; background:var(--bg); color:var(--ink); }
+  .once .hint { width:100%; color:var(--muted); font-size:13px; }
+  .pending { display:flex; align-items:center; gap:12px; background:var(--bg); border-radius:12px; padding:12px 14px; }
+  .pending .t { flex:1; } .pending .t b { display:block; }
+  .pending .t span { color:var(--muted); font-size:13px; }
   .warn { background:#fef3c7; color:#92400e; padding:10px 14px; border-radius:10px; margin-top:12px; font-size:14px; }
   html[data-theme="dark"] .warn { background:#3b2a08; color:#fcd34d; }
 
@@ -195,7 +205,22 @@ async function doAction(action) {
   catch (e) { toast(e.message, true); }
   finally { btns.forEach(b => b.disabled = false); }
 }
+function renderOnce(o) {
+  const pending = !!(o && o.at);
+  $('#once-pending').hidden = !pending; $('#once-form').hidden = pending;
+  if (pending) { $('#once-when').textContent = o.text; $('#once-sub').textContent = 'Stored on the device — runs even if this PC is off'; }
+}
+async function loadOnce() { try { renderOnce(await api('/api/once')); } catch (e) {} }
 if ($('#hero')) {
+  $('#once-set').onclick = async () => {
+    const [hh, mm] = $('#once-time').value.split(':').map(Number), dur = +$('#once-dur').value;
+    if (isNaN(hh)) return toast('Pick a time', true);
+    try { const d = await api('/api/once', {hh, mm, dur}); toast(d.feedback); renderOnce(d); } catch (e) { toast(e.message, true); }
+  };
+  $('#once-cancel').onclick = async () => {
+    try { const d = await api('/api/once', {cancel: true}); toast(d.feedback); renderOnce(d); } catch (e) { toast(e.message, true); }
+  };
+  loadOnce(); setInterval(loadOnce, 30000);
   document.querySelectorAll('button[data-action]').forEach(b => b.onclick = () => doAction(b.dataset.action));
   $('#mins').addEventListener('keydown', e => { if (e.key === 'Enter') doAction('timer'); });
   loadState(); setInterval(loadState, 5000);
@@ -357,6 +382,22 @@ BODIES = {
       <button data-action="timer">Heat</button>
     </div>
   </div>
+  <div class="card">
+    <h2>⏰ Heat once</h2>
+    <div id="once-pending" class="pending" hidden>
+      <div class="t"><b id="once-when"></b><span id="once-sub"></span></div>
+      <button class="sm" id="once-cancel">Cancel</button>
+    </div>
+    <div id="once-form" class="once">
+      <input type="time" id="once-time" value="18:00">
+      <select id="once-dur">
+        <option value="15">15 min</option><option value="30">30 min</option><option value="45" selected>45 min</option>
+        <option value="60">60 min</option><option value="90">90 min</option><option value="120">120 min</option>
+      </select>
+      <button class="hot sm" id="once-set">Set</button>
+      <div class="hint">Heats one time at the next occurrence of that time, then clears. Daily schedules are on the Settings page.</div>
+    </div>
+  </div>
 """,
     "/history": """
   <div class="card">
@@ -492,6 +533,26 @@ def graph_caption() -> dict:
         caption += "\n" + note
     return {"caption": caption}
 
+def once_payload(once: dict = None, feedback: str = "") -> dict:
+    once = once if once is not None else bot.get_once()
+    return {"at": once.get("at", 0), "dur": once.get("dur"), "local": once.get("local"),
+            "in": once.get("in", 0), "text": bot.once_text(once), "feedback": feedback}
+
+def do_once(body: dict, client: str) -> tuple:
+    if body.get("cancel"):
+        once = bot.cancel_once()
+        bot.log_event("web_once", client=client, action="cancel")
+        return 200, once_payload(once, "One-time schedule cancelled")
+    try:
+        hh, mm, dur = int(body.get("hh")), int(body.get("mm")), int(body.get("dur"))
+    except (TypeError, ValueError):
+        return 400, {"error": "hh, mm and dur are required"}
+    if not (0 <= hh <= 23 and 0 <= mm <= 59 and 1 <= dur <= 720):
+        return 400, {"error": "hh 0-23, mm 0-59, dur 1-720"}
+    once = bot.set_once(hh, mm, dur)
+    bot.log_event("web_once", client=client, action="set", hh=hh, mm=mm, dur=dur, at=once.get("at"))
+    return 200, once_payload(once, f"⏰ Will heat once at {bot.once_text(once)}")
+
 def usage_payload(days: int) -> dict:
     """Daily + hour-of-day totals for the charts (same maths as /graph)."""
     days = max(1, min(days, 90))
@@ -624,6 +685,8 @@ class Handler(BaseHTTPRequestHandler):
             self._guard(lambda: (200, graph_caption()))
         elif path == "/api/settings":
             self._guard(lambda: (200, settings_payload()))
+        elif path == "/api/once":
+            self._guard(lambda: (200, once_payload()))
         elif path == "/api/usage":
             q = parse_qs(urlsplit(self.path).query)
             try:
@@ -652,6 +715,8 @@ class Handler(BaseHTTPRequestHandler):
             self._guard(lambda: do_action(body, client))
         elif path == "/api/schedule":
             self._guard(lambda: do_schedule(body, client))
+        elif path == "/api/once":
+            self._guard(lambda: do_once(body, client))
         else:
             self._json(404, {"error": "not found"})
 
